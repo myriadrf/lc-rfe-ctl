@@ -1,7 +1,7 @@
 LibreCellular RF Front-End Control Firmware & Software
 ======================================================
 
-.. image:: https://raw.githubusercontent.com/myriadrf/lc-rfe/main/images/RFE_GUI_100724_1.png
+.. image:: /images/RFE_GUI_100724_1.png
    :alt: LibreCellular RFE GUI.
 
 This repository contains the control firmware and software for the RF Front-End (RFE).
