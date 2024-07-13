@@ -1,5 +1,5 @@
-LibreCellular RF Front-End Control Firmware & Software
-======================================================
+LibreCellular RFE Control Firmware & Software
+=============================================
 
 .. image:: /images/RFE_GUI_100724_1.png
    :alt: LibreCellular RFE GUI.
