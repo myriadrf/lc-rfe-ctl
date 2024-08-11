@@ -124,7 +124,7 @@ class RFEGui(QMainWindow):
         else:
             port = self.comboPorts.currentText()
             if port:
-                self.ser = serial.Serial(port, 9600, timeout=1)
+                self.ser = serial.Serial(port, 9600, timeout=5)
                 self.btnOpenClosePort.setText('Close Port')
 
                 self.ser.write("VERSION\n".encode())
