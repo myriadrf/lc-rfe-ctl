@@ -22,11 +22,15 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+
+// XXX this needs to be tidied up...
+
 #include <stdio.h>
 #include <string.h>
 
 #include "usbd_cdc_if.h"
 
+#include "util.h"
 #include "func_sys.h"
 #include "func_rf.h"
 /* USER CODE END Includes */
@@ -38,7 +42,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define FW_VER     0.1
+#define FW_VER     0.2
 
 // use USB CDC for printf()? If not set, UART2 will be used.
 // side effect: an active USB connection is required for things to work
@@ -63,8 +67,6 @@ DMA_HandleTypeDef hdma_adc1;
 
 I2C_HandleTypeDef hi2c2;
 
-SPI_HandleTypeDef hspi1;
-SPI_HandleTypeDef hspi2;
 SPI_HandleTypeDef hspi3;
 
 TIM_HandleTypeDef htim3;
@@ -76,6 +78,9 @@ volatile uint8_t EndOfConversion;
 uint16_t adc_data[3];
 
 float vsense_5v, vsense_12v, vsense_24v;
+
+extern rf_sw_sp3t IC904, IC1004;
+extern rf_sw_spdt IC903, IC905, IC1003, IC1005, IC1501_1502, IC1601_1602;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -85,8 +90,6 @@ static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C2_Init(void);
-static void MX_SPI1_Init(void);
-static void MX_SPI2_Init(void);
 static void MX_SPI3_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
@@ -134,14 +137,17 @@ int main(void)
   MX_USART2_UART_Init();
   MX_ADC1_Init();
   MX_I2C2_Init();
-  MX_SPI1_Init();
-  MX_SPI2_Init();
   MX_SPI3_Init();
   MX_USB_Device_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t)&adc_data, 3);
   HAL_TIM_Base_Start(&htim3);
+  led_on();
+
+  // XXX: TDD operation is not implemented yet, so for now we just ignore it
+  set_sw_pos_spdt(IC1501_1502, SW_POS_2);
+  set_sw_pos_spdt(IC1601_1602, SW_POS_2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -156,7 +162,94 @@ int main(void)
 		  vsense_24v = ((float)adc_data[2] / 4095.0) * 3.283 * RATIO_24V;
 		  EndOfConversion = 0;
 	  }
-    /* USER CODE END WHILE */
+
+	  //////////////
+	  // Test Cases
+	  //////////////
+
+	  ////// SDR TX -> PA -> TRX IO
+/*
+	  //// PM block
+	  // sw1: j2
+	  set_sw_pos_sp3t(IC904, SW_POS_2);
+	  set_sw_pos_sp3t(IC1004, SW_POS_2);
+      // sw2: don't care
+	  set_sw_pos_spdt(IC905, SW_POS_1);
+	  set_sw_pos_spdt(IC1005, SW_POS_1);
+      // sw3@ don't care
+	  set_sw_pos_spdt(IC903, SW_POS_1);
+	  set_sw_pos_spdt(IC1003, SW_POS_1);
+
+	  //// TDD block
+	  set_sw_pos_spdt(IC1501_1502, SW_POS_2);
+	  set_sw_pos_spdt(IC1601_1602, SW_POS_2);
+*/
+
+	  ////// SDR TX -> Power Meter
+/*
+	  //// PM block
+	  // sw1: j3
+	  set_sw_pos_sp3t(IC904, SW_POS_3);
+	  set_sw_pos_sp3t(IC1004, SW_POS_3);
+      // sw2: don't care
+	  set_sw_pos_spdt(IC905, SW_POS_1);
+	  set_sw_pos_spdt(IC1005, SW_POS_1);
+      // sw3: j2
+	  set_sw_pos_spdt(IC903, SW_POS_2);
+	  set_sw_pos_spdt(IC903, SW_POS_2);
+*/
+/*
+	  setRFPowerMeter(RF_CH_A, POWER_METER_SDR);
+	  setRFPowerMeter(RF_CH_B, POWER_METER_SDR);
+
+	  uint16_t r = getRFPowerLevelRawBitbang(RF_CH_A);
+	  printf("SDR CH A Result: %d\r\n", r);
+	  r = getRFPowerLevelRawBitbang(RF_CH_B);
+	  printf("SDR CH B Result: %d\r\n----------------\r\n", r);
+*/
+
+	  ////// Ext u.FL -> Power Meter
+/*
+	  //// PM block
+	  // sw1: don't care - j2: SDR_TX -> TX_OUT
+	  set_sw_pos_sp3t(IC904, SW_POS_2);
+	  set_sw_pos_sp3t(IC1004, SW_POS_2);
+      // sw2: don't care - j2: RX_IN -> SDR_RX
+	  set_sw_pos_spdt(IC905, SW_POS_1);
+	  set_sw_pos_spdt(IC1005, SW_POS_1);
+      // sw3: j1
+	  set_sw_pos_spdt(IC903, SW_POS_1);
+	  set_sw_pos_spdt(IC903, SW_POS_1);
+
+	  uint16_t r = getRFPowerLevelRawBitbang(RF_CH_A);
+	  printf("Ext CH A Result: %d\r\n", r);
+	  r = getRFPowerLevelRawBitbang(RF_CH_B);
+	  printf("Ext CH B Result: %d\r\n----------------\r\n", r);
+*/
+
+	  ////// RX A IN -> RX A OUT (SDR) with attenuator
+/*
+	  //// TDD block
+	  set_sw_pos_spdt(IC1501_1502, SW_POS_2);
+	  set_sw_pos_spdt(IC1601_1602, SW_POS_2);
+	  //// PM block
+	  // sw1: don't care - j2: SDR_TX -> TX_OUT
+	  set_sw_pos_sp3t(IC904, SW_POS_2);
+	  set_sw_pos_sp3t(IC1004, SW_POS_2);
+      // sw2: j2: RX_IN -> SDR_RX
+	  set_sw_pos_spdt(IC905, SW_POS_2);
+	  set_sw_pos_spdt(IC1005, SW_POS_2);
+      // sw3: don't care
+	  set_sw_pos_spdt(IC903, SW_POS_1);
+	  set_sw_pos_spdt(IC903, SW_POS_1);
+	  //// Attenuator
+	  setRxAttenuation(RF_CH_A, 20);
+	  setRxAttenuation(RF_CH_B, 20);
+*/
+
+	  //HAL_Delay(2000);
+
+	  /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
@@ -330,86 +423,6 @@ static void MX_I2C2_Init(void)
 }
 
 /**
-  * @brief SPI1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SPI1_Init(void)
-{
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_1LINE;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 7;
-  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
-
-}
-
-/**
-  * @brief SPI2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SPI2_Init(void)
-{
-
-  /* USER CODE BEGIN SPI2_Init 0 */
-
-  /* USER CODE END SPI2_Init 0 */
-
-  /* USER CODE BEGIN SPI2_Init 1 */
-
-  /* USER CODE END SPI2_Init 1 */
-  /* SPI2 parameter configuration*/
-  hspi2.Instance = SPI2;
-  hspi2.Init.Mode = SPI_MODE_MASTER;
-  hspi2.Init.Direction = SPI_DIRECTION_1LINE;
-  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi2.Init.CRCPolynomial = 7;
-  hspi2.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-  hspi2.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
-  if (HAL_SPI_Init(&hspi2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI2_Init 2 */
-
-  /* USER CODE END SPI2_Init 2 */
-
-}
-
-/**
   * @brief SPI3 Initialization Function
   * @param None
   * @retval None
@@ -427,13 +440,13 @@ static void MX_SPI3_Init(void)
   /* SPI3 parameter configuration*/
   hspi3.Instance = SPI3;
   hspi3.Init.Mode = SPI_MODE_MASTER;
-  hspi3.Init.Direction = SPI_DIRECTION_1LINE;
+  hspi3.Init.Direction = SPI_DIRECTION_2LINES;
   hspi3.Init.DataSize = SPI_DATASIZE_8BIT;
   hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi3.Init.NSS = SPI_NSS_SOFT;
-  hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-  hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+  hspi3.Init.FirstBit = SPI_FIRSTBIT_LSB;
   hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
   hspi3.Init.CRCPolynomial = 7;
@@ -580,7 +593,8 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, GPIO_5V_EN_Pin|GPIO_12V_EN_Pin|GPIO_PM_A_CTRL_3_Pin|GPIO_PM_A_CTRL_4_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_LED_Pin|GPIO_PM_B_CONV_Pin|GPIO_PM_A_CTRL_2_Pin|GPIO_LNA_B_EN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PM_B_SCK_Pin|GPIO_LED_Pin|GPIO_PM_A_SCK_Pin|GPIO_PM_B_CONV_Pin
+                          |GPIO_PM_A_CTRL_2_Pin|GPIO_LNA_B_EN_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PM_A_CONV_Pin|GPIO_PM_B_CTRL_1_Pin|GPIO_PM_B_CTRL_2_Pin|GPIO_PM_B_CTRL_3_Pin
@@ -603,11 +617,19 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIO_12V_PG_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : GPIO_LED_Pin GPIO_PM_B_CONV_Pin GPIO_PM_A_CTRL_2_Pin GPIO_LNA_B_EN_Pin */
-  GPIO_InitStruct.Pin = GPIO_LED_Pin|GPIO_PM_B_CONV_Pin|GPIO_PM_A_CTRL_2_Pin|GPIO_LNA_B_EN_Pin;
+  /*Configure GPIO pins : GPIO_PM_B_SCK_Pin GPIO_LED_Pin GPIO_PM_A_SCK_Pin GPIO_PM_B_CONV_Pin
+                           GPIO_PM_A_CTRL_2_Pin GPIO_LNA_B_EN_Pin */
+  GPIO_InitStruct.Pin = GPIO_PM_B_SCK_Pin|GPIO_LED_Pin|GPIO_PM_A_SCK_Pin|GPIO_PM_B_CONV_Pin
+                          |GPIO_PM_A_CTRL_2_Pin|GPIO_LNA_B_EN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : GPIO_PM_B_MISO_Pin GPIO_PM_A_MISO_Pin */
+  GPIO_InitStruct.Pin = GPIO_PM_B_MISO_Pin|GPIO_PM_A_MISO_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : GPIO_PM_A_CONV_Pin GPIO_PM_B_CTRL_1_Pin GPIO_PM_B_CTRL_2_Pin GPIO_PM_B_CTRL_3_Pin
@@ -655,17 +677,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 	EndOfConversion = 1;
 }
 
-void _float_to_string(float val, char *buf)
-{
-    int val_int = (int)val;
-    int val_dec = (int)((val - val_int) * 100); // 2 decimal places
-    // negative values
-    if (val < 0) {
-        *buf++ = '-';
-        val = -val;
-    }
-    sprintf(buf, "%d.%02d", val_int, val_dec);
-}
 
 void resp_ok()
 {
@@ -680,6 +691,11 @@ void resp_error()
 void resp_int(int val)
 {
   printf("%d\n", val);
+}
+
+void resp_uint16(uint16_t val)
+{
+  printf("%u\n", (unsigned int)val);
 }
 
 void resp_bool(bool val)
@@ -830,11 +846,11 @@ void handle_command(char *cmd)
     setTxRxLoopback(RF_CH_B, RF_INACTIVE);
     resp_ok();
   } else if (strcmp(cmd, "PWRLEVEL_A_READ") == 0) {
-    int pwrlevel = getRFPowerLevelRaw(RF_CH_A);
-    resp_int(pwrlevel);
+    uint16_t pwrlevel = getRFPowerLevelRawBitbang(RF_CH_A);
+	resp_uint16(pwrlevel);
   } else if (strcmp(cmd, "PWRLEVEL_B_READ") == 0) {
-    int pwrlevel = getRFPowerLevelRaw(RF_CH_B);
-    resp_int(pwrlevel);
+	uint16_t pwrlevel = getRFPowerLevelRawBitbang(RF_CH_B);
+	resp_uint16(pwrlevel);
   } else if (strcmp(cmd, "PWRMEAS_A_OFF") == 0) {
     setRFPowerMeter(RF_CH_A, POWER_METER_OFF);
     resp_ok();
