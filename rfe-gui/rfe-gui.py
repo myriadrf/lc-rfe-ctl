@@ -7,6 +7,15 @@ from PyQt6 import uic
 from PyQt6.QtWidgets import QApplication, QMainWindow, QComboBox, QPushButton, QLabel
 from PyQt6.QtGui import QPixmap
 
+RFE_GUI_VERSION = '0.2'
+
+# Timeout for status bar messages (ms)
+STATUS_TIMEOUT_MS = 3000
+# Serial response timeout in seconds for blocking commands
+RESPONSE_TIMEOUT_S = 1.0
+# Delay between serial commands for proper sequencing (s)
+CMD_DELAY_S = 0.05
+
 class RFEGui(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -14,12 +23,16 @@ class RFEGui(QMainWindow):
         # Load the UI file
         uic.loadUi('layout.ui', self)
 
+        # Set window title and version
+        self.setWindowTitle(f'LibreCellular RFE GUI v{RFE_GUI_VERSION}')
+
         self.ser = None  # Serial connection will be initialized after selecting a port
 
         # Get UI elements
         self.lblLogo = self.findChild(QLabel, 'lblLogo')
         self.comboPorts = self.findChild(QComboBox, 'comboPorts')
         self.btnOpenClosePort = self.findChild(QPushButton, 'btnOpenClosePort')
+        self.btnRefreshPorts = self.findChild(QPushButton, 'btnRefreshPorts')
         self.btn5VOn = self.findChild(QPushButton, 'btn5VOn')
         self.btn12VOn = self.findChild(QPushButton, 'btn12VOn')
         self.btn5VOff = self.findChild(QPushButton, 'btn5VOff')
@@ -61,39 +74,36 @@ class RFEGui(QMainWindow):
 
         # Connect buttons to functions
         self.btnOpenClosePort.clicked.connect(self.toggle_port)
-        self.btn5VOn.clicked.connect(lambda: self.send_command('5V_ON'))
-        self.btn12VOn.clicked.connect(lambda: self.send_command('12V_ON'))
-        self.btn5VOff.clicked.connect(lambda: self.send_command('5V_OFF'))
-        self.btn12VOff.clicked.connect(lambda: self.send_command('12V_OFF'))
-        self.btnPort1On.clicked.connect(lambda: self.send_command('RELAY1_ON'))
-        self.btnPort1Off.clicked.connect(lambda: self.send_command('RELAY1_OFF'))
-        self.btnPort2On.clicked.connect(lambda: self.send_command('RELAY2_ON'))
-        self.btnPort2Off.clicked.connect(lambda: self.send_command('RELAY2_OFF'))
+        self.btnRefreshPorts.clicked.connect(self.update_ports)
+        self.btn5VOn.clicked.connect(lambda: self.send_command('PWR:ON:5V'))
+        self.btn12VOn.clicked.connect(lambda: self.send_command('PWR:ON:12V'))
+        self.btn5VOff.clicked.connect(lambda: self.send_command('PWR:OFF:5V'))
+        self.btn12VOff.clicked.connect(lambda: self.send_command('PWR:OFF:12V'))
+        self.btnPort1On.clicked.connect(lambda: self.send_command('RELAY:ON:1'))
+        self.btnPort1Off.clicked.connect(lambda: self.send_command('RELAY:OFF:1'))
+        self.btnPort2On.clicked.connect(lambda: self.send_command('RELAY:ON:2'))
+        self.btnPort2Off.clicked.connect(lambda: self.send_command('RELAY:OFF:2'))
         self.btnUpdateVolts.clicked.connect(self.update_volts)
-        self.btnLNA_A_Active.clicked.connect(lambda: self.send_command('LNA_A_ACTIVE'))
-        self.btnLNA_A_Bypass.clicked.connect(lambda: self.send_command('LNA_A_BYPASS'))
-        self.btnLNA_B_Active.clicked.connect(lambda: self.send_command('LNA_B_ACTIVE'))
-        self.btnLNA_B_Bypass.clicked.connect(lambda: self.send_command('LNA_B_BYPASS'))
-        self.btnPA_A_Active.clicked.connect(lambda: self.send_command('PA_A_ACTIVE'))
-        self.btnPA_A_Bypass.clicked.connect(lambda: self.send_command('PA_A_BYPASS'))
-        self.btnPA_B_Active.clicked.connect(lambda: self.send_command('PA_B_ACTIVE'))
-        self.btnPA_B_Bypass.clicked.connect(lambda: self.send_command('PA_B_BYPASS'))
-        self.btnTXInhibit_A_Active.clicked.connect(lambda: self.send_command('TXINHIBIT_A_ACTIVE'))
-        self.btnTXInhibit_A_Inactive.clicked.connect(lambda: self.send_command('TXINHIBIT_A_INACTIVE'))
-        self.btnTXInhibit_B_Active.clicked.connect(lambda: self.send_command('TXINHIBIT_B_ACTIVE'))
-        self.btnTXInhibit_B_Inactive.clicked.connect(lambda: self.send_command('TXINHIBIT_B_INACTIVE'))
-        self.btnTXRXLoop_A_Active.clicked.connect(lambda: self.send_command('TXRXLOOP_A_ACTIVE'))
-        self.btnTXRXLoop_A_Inactive.clicked.connect(lambda: self.send_command('TXRXLOOP_A_INACTIVE'))
-        self.btnTXRXLoop_B_Active.clicked.connect(lambda: self.send_command('TXRXLOOP_B_ACTIVE'))
-        self.btnTXRXLoop_B_Inactive.clicked.connect(lambda: self.send_command('TXRXLOOP_B_INACTIVE'))
-        self.btnPwrMeas_A_Set.clicked.connect(lambda: self.send_command(f'PWRMEAS_A_{self.comboPwrMeasMode_A.currentText()}'))
-        self.btnPwrMeas_B_Set.clicked.connect(lambda: self.send_command(f'PWRMEAS_B_{self.comboPwrMeasMode_B.currentText()}'))
-        self.btnPwrLevel_A_Read.clicked.connect(lambda: self.lblPowerLevel_A.setText(self.send_command('PWRLEVEL_A_READ').rstrip()))
-        self.btnPwrLevel_B_Read.clicked.connect(lambda: self.lblPowerLevel_B.setText(self.send_command('PWRLEVEL_B_READ').rstrip()))
-        self.btnSetAtten_A.clicked.connect(lambda: self.send_command(f'RXATTEN_A_{float(self.comboRXAtten_A.currentText()):.2f}'))
-        self.btnSetAtten_B.clicked.connect(lambda: self.send_command(f'RXATTEN_B_{float(self.comboRXAtten_B.currentText()):.2f}'))
-        self.btnReset_A.clicked.connect(lambda: self.send_command('RESET_A'))
-        self.btnReset_B.clicked.connect(lambda: self.send_command('RESET_B'))
+        self.btnLNA_A_Active.clicked.connect(lambda: self.send_command('LNA:ON:A'))
+        self.btnLNA_A_Bypass.clicked.connect(lambda: self.send_command('LNA:OFF:A'))
+        self.btnLNA_B_Active.clicked.connect(lambda: self.send_command('LNA:ON:B'))
+        self.btnLNA_B_Bypass.clicked.connect(lambda: self.send_command('LNA:OFF:B'))
+        self.btnPA_A_Active.clicked.connect(lambda: self.send_command('PA:ON:A'))
+        self.btnPA_A_Bypass.clicked.connect(lambda: self.send_command('PA:OFF:A'))
+        self.btnPA_B_Active.clicked.connect(lambda: self.send_command('PA:ON:B'))
+        self.btnPA_B_Bypass.clicked.connect(lambda: self.send_command('PA:OFF:B'))
+        self.btnTXInhibit_A_Active.clicked.connect(lambda: self.send_command('TDD:ON:A'))
+        self.btnTXInhibit_A_Inactive.clicked.connect(lambda: self.send_command('TDD:OFF:A'))
+        self.btnTXInhibit_B_Active.clicked.connect(lambda: self.send_command('TDD:ON:B'))
+        self.btnTXInhibit_B_Inactive.clicked.connect(lambda: self.send_command('TDD:OFF:B'))
+        self.btnPwrMeas_A_Set.clicked.connect(lambda: self.send_command(f'PWRMEAS:A:{self.comboPwrMeasMode_A.currentText()}'))
+        self.btnPwrMeas_B_Set.clicked.connect(lambda: self.send_command(f'PWRMEAS:B:{self.comboPwrMeasMode_B.currentText()}'))
+        self.btnPwrLevel_A_Read.clicked.connect(self.read_pwr_level_A)
+        self.btnPwrLevel_B_Read.clicked.connect(self.read_pwr_level_B)
+        self.btnSetAtten_A.clicked.connect(lambda: self.send_command(f'RXATTEN:A:{float(self.comboRXAtten_A.currentText()):.2f}'))
+        self.btnSetAtten_B.clicked.connect(lambda: self.send_command(f'RXATTEN:B:{float(self.comboRXAtten_B.currentText()):.2f}'))
+        self.btnReset_A.clicked.connect(lambda: self.send_command('RESET:A'))
+        self.btnReset_B.clicked.connect(lambda: self.send_command('RESET:B'))
 
         # Load logo image
         logoPixmap = QPixmap('lc_logo.png')
@@ -120,46 +130,87 @@ class RFEGui(QMainWindow):
         if self.ser and self.ser.is_open:
             self.ser.close()
             self.btnOpenClosePort.setText('Open Port')
-            self.statusBar().showMessage('Port Status: Closed')
+            self.statusBar().showMessage('Port Status: Closed', STATUS_TIMEOUT_MS)
         else:
             port = self.comboPorts.currentText()
             if port:
                 self.ser = serial.Serial(port, 9600, timeout=5)
                 self.btnOpenClosePort.setText('Close Port')
+                self.send_command("VERSION")
 
-                self.ser.write("VERSION\n".encode())
-                time.sleep(0.1)
-                self.ser.reset_input_buffer()
 
-                self.update_volts()
-
-                self.ser.write("VERSION\n".encode())
-                self.statusBar().showMessage(f'Port Status: Open ({port}), FW Version: {self.ser.readline().decode("utf-8").rstrip()}')
 
     def send_command(self, command):
         if self.ser and self.ser.is_open:
-            command_term = f'{command}\n'
-            self.ser.write(command_term.encode())  # Send the command
-            response = self.ser.readline().decode('utf-8')  # Read the response
-            self.statusBar().showMessage(f'Command: {command}, Response: {response}')  # Append the response to the text box
+            # flush any leftover data to align responses
+            self.ser.reset_input_buffer()
+            # send command and wait for device to process
+            self.ser.write(f'{command}\n'.encode())
+            time.sleep(CMD_DELAY_S)
+            response = None
+            while True:
+                raw = self.ser.readline()
+                if not raw:
+                    break
+                line = raw.decode('utf-8').strip()
+                # Print debug messages but don't use them as responses
+                if line.startswith('#') or line.startswith('[') or line.startswith('>'):
+                    print(line)
+                    continue
+                # Skip empty lines
+                if not line:
+                    continue
+                # only accept OK, ERROR, or numeric values
+                if line == 'OK' or line.startswith('ERROR:'):
+                    response = line
+                    break
+                try:
+                    float(line)
+                    response = line
+                    break
+                except ValueError:
+                    continue
+            if response is None:
+                return None
+            if response.startswith('ERROR:'):
+                reason = response.split(':',1)[1].strip()
+                self.statusBar().showMessage(f'❌ Error: {reason}', STATUS_TIMEOUT_MS)
+            else:
+                self.statusBar().showMessage(f'✅ Command: {command}, Response: {response}', STATUS_TIMEOUT_MS)
             return response
-        else:
-            self.statusBar().showMessage('Port is not open.')
+        self.statusBar().showMessage('Port is not open.', STATUS_TIMEOUT_MS)
 
     def closeEvent(self, event):
         if self.ser and self.ser.is_open:
             self.ser.close()
         event.accept()
 
+    def _update_label(self, command, label, suffix=''):
+        """Send a command expecting a numeric response and update the given label."""
+        val = self.send_command(command)
+        if val is None or val.startswith('ERROR:'):
+            self.statusBar().showMessage('❌ No response from device.', STATUS_TIMEOUT_MS)
+        else:
+            try:
+                float(val)
+            except ValueError:
+                self.statusBar().showMessage('❌ Invalid response.', STATUS_TIMEOUT_MS)
+            else:
+                label.setText(f'{val.rstrip()}{suffix}')
+
     def update_volts(self):
-        val5V = self.send_command('VSENSE_5V')
-        val12V = self.send_command('VSENSE_12V')
-        val24V = self.send_command('VSENSE_24V')
+        # update voltage labels using generic numeric handler
+        self._update_label('VSENSE:5V', self.lbl5V, 'V')
+        self._update_label('VSENSE:12V', self.lbl12V, 'V')
+        self._update_label('VSENSE:24V', self.lbl24V, 'V')
 
-        self.lbl5V.setText(f'{val5V.rstrip()}V')
-        self.lbl12V.setText(f'{val12V.rstrip()}V')
-        self.lbl24V.setText(f'{val24V.rstrip()}V')
+    def read_pwr_level_A(self):
+        # update power level A label
+        self._update_label('PWRLEVEL:A:READ', self.lblPowerLevel_A)
 
+    def read_pwr_level_B(self):
+        # update power level B label
+        self._update_label('PWRLEVEL:B:READ', self.lblPowerLevel_B)
 
 def frange(start, stop, step):
     return takewhile(lambda x: x< stop, count(start, step))

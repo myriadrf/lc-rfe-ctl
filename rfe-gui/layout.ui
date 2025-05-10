@@ -30,13 +30,26 @@
      <property name="geometry">
       <rect>
        <x>20</x>
-       <y>70</y>
+       <y>65</y>
        <width>91</width>
-       <height>51</height>
+       <height>30</height>
       </rect>
      </property>
      <property name="text">
       <string>Open Port</string>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="btnRefreshPorts">
+     <property name="geometry">
+      <rect>
+       <x>20</x>
+       <y>100</y>
+       <width>91</width>
+       <height>30</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Refresh Ports</string>
      </property>
     </widget>
     <widget class="QComboBox" name="comboPorts">
@@ -638,12 +651,12 @@
        <rect>
         <x>20</x>
         <y>120</y>
-        <width>91</width>
+        <width>120</width>
         <height>21</height>
        </rect>
       </property>
       <property name="text">
-       <string>TX Inhibit</string>
+       <string>TDD Mode (TX Inhibit)</string>
       </property>
      </widget>
      <widget class="QLabel" name="label_21">
@@ -952,12 +965,12 @@
        <rect>
         <x>20</x>
         <y>120</y>
-        <width>91</width>
+        <width>120</width>
         <height>21</height>
        </rect>
       </property>
       <property name="text">
-       <string>TX Inhibit</string>
+       <string>TDD Mode (TX Inhibit)</string>
       </property>
      </widget>
      <widget class="QLabel" name="label_20">
