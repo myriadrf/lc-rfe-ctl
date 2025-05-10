@@ -1,20 +1,20 @@
 #include <stdio.h>
 #include <stdint.h>
 
-void _binp8(uint8_t val){
-    printf("0b%d%d%d%d%d%d%d%d",
-           (val >> 7) & 1, (val >> 6) & 1, (val >> 5) & 1, (val >> 4) & 1,
-           (val >> 3) & 1, (val >> 2) & 1, (val >> 1) & 1, (val >> 0) & 1);
+void _binp(uint64_t val, int bits) {
+    printf("0b");
+    for (int i = bits - 1; i >= 0; i--) {
+        printf("%d", (val >> i) & 1);
+    }
 }
 
-void _float_to_string(float val, char *buf)
-{
-    int val_int = (int)val;
-    int val_dec = (int)((val - val_int) * 100); // 2 decimal places
-    // negative values
-    if (val < 0) {
-        *buf++ = '-';
-        val = -val;
-    }
-    sprintf(buf, "%d.%02d", val_int, val_dec);
+void _binp8(uint8_t val) { _binp(val, 8); }
+void _binp16(uint16_t val) { _binp(val, 16); }
+void _binp32(uint32_t val) { _binp(val, 32); }
+
+uint8_t _reverse_bits(uint8_t b) {
+  b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+  b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+  b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+  return b;
 }

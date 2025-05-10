@@ -64,7 +64,7 @@
   */
 
 /* USER CODE BEGIN PRIVATE_DEFINES */
-#define CMD_BUFFER_SIZE 64
+#define CMD_BUFFER_SIZE 100
 /* USER CODE END PRIVATE_DEFINES */
 
 /**
@@ -97,7 +97,7 @@ uint8_t UserRxBufferFS[APP_RX_DATA_SIZE];
 uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
-char cmd_buffer[CMD_BUFFER_SIZE];
+char cmd_buffer[CMD_BUFFER_SIZE] = {0};  // Initialize with zeros
 uint8_t cmd_index = 0;
 /* USER CODE END PRIVATE_VARIABLES */
 
@@ -132,7 +132,7 @@ static int8_t CDC_Receive_FS(uint8_t* pbuf, uint32_t *Len);
 static int8_t CDC_TransmitCplt_FS(uint8_t *pbuf, uint32_t *Len, uint8_t epnum);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
-extern void handle_command(char *cmd);
+extern void queue_command(char *cmd);
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
@@ -265,26 +265,41 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
+    // Process each byte in the received buffer
     for (uint32_t i = 0; i < *Len; i++) {
-        // If newline character is received, process the command
-        if (Buf[i] == '\n') {
-            cmd_buffer[cmd_index] = '\0';  // Null-terminate the command string
-            handle_command(cmd_buffer);    // Process the command
-            cmd_index = 0;                 // Reset command buffer index
-        } else {
-            // Add received character to command buffer
+        // Check for end of command (newline or carriage return)
+        if (Buf[i] == '\n' || Buf[i] == '\r') {
+            // Only process non-empty commands
+            if (cmd_index > 0) {
+                // Null-terminate the command string
+                cmd_buffer[cmd_index] = '\0';
+                
+                // Add the command to the queue to be processed
+                queue_command(cmd_buffer);
+                
+                // Reset command buffer index
+                cmd_index = 0;
+            }
+        } 
+        // Only store printable characters and tab
+        else if (Buf[i] >= 32 || Buf[i] == '\t') {
+            // Check for buffer overflow
             if (cmd_index < CMD_BUFFER_SIZE - 1) {
+                // Add character to buffer
                 cmd_buffer[cmd_index++] = Buf[i];
             } else {
-                // Buffer overflow, reset the buffer and send error
+                // Buffer overflow - reset buffer and send error
                 cmd_index = 0;
-                char error_message[] = "Buffer overflow\r\n";
+                char error_message[] = "ERROR:OVERFLOW\n";
                 CDC_Transmit_FS((uint8_t*)error_message, strlen(error_message));
             }
         }
     }
+
+    // Set up for next reception
     USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
     USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+
     return (USBD_OK);
   /* USER CODE END 6 */
 }

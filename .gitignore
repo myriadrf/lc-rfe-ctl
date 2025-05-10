@@ -1,5 +1,7 @@
 __TESTS/
 
+rfe-gui/venv/
+
 # Eclipse
 .metadata
 .settings

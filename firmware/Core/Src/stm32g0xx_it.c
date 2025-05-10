@@ -58,7 +58,6 @@
 extern PCD_HandleTypeDef hpcd_USB_DRD_FS;
 extern DMA_HandleTypeDef hdma_adc1;
 extern ADC_HandleTypeDef hadc1;
-extern UART_HandleTypeDef huart2;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -183,20 +182,6 @@ void ADC1_COMP_IRQHandler(void)
   /* USER CODE BEGIN ADC1_COMP_IRQn 1 */
 
   /* USER CODE END ADC1_COMP_IRQn 1 */
-}
-
-/**
-  * @brief This function handles USART2 + LPUART2 Interrupt.
-  */
-void USART2_LPUART2_IRQHandler(void)
-{
-  /* USER CODE BEGIN USART2_LPUART2_IRQn 0 */
-
-  /* USER CODE END USART2_LPUART2_IRQn 0 */
-  HAL_UART_IRQHandler(&huart2);
-  /* USER CODE BEGIN USART2_LPUART2_IRQn 1 */
-
-  /* USER CODE END USART2_LPUART2_IRQn 1 */
 }
 
 /* USER CODE BEGIN 1 */

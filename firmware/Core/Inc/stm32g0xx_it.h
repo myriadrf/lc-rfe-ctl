@@ -22,7 +22,7 @@
 #define __STM32G0xx_IT_H
 
 #ifdef __cplusplus
- extern "C" {
+extern "C" {
 #endif
 
 /* Private includes ----------------------------------------------------------*/
@@ -54,7 +54,6 @@ void SysTick_Handler(void);
 void USB_UCPD1_2_IRQHandler(void);
 void DMA1_Channel1_IRQHandler(void);
 void ADC1_COMP_IRQHandler(void);
-void USART2_LPUART2_IRQHandler(void);
 /* USER CODE BEGIN EFP */
 
 /* USER CODE END EFP */

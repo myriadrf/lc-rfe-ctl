@@ -22,17 +22,15 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
-// XXX this needs to be tidied up...
-
 #include <stdio.h>
+#include <stdarg.h>  // va_list, va_start, va_end
+#include <stdlib.h>  // strtof
 #include <string.h>
-
 #include "usbd_cdc_if.h"
-
 #include "util.h"
 #include "func_sys.h"
 #include "func_rf.h"
+#include "test_modes.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -42,7 +40,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define FW_VER     0.2
+#define FW_VER     0.3
+
+#define DEBUG_PRINT
 
 // use USB CDC for printf()? If not set, UART2 will be used.
 // side effect: an active USB connection is required for things to work
@@ -50,10 +50,41 @@
 // not really a problem if your use case has a USB cable plugged in all the time.
 #define PRINTF_USB_CDC
 
+// For our custom cdcprintf() functionality
+#define CDC_QUEUE_SIZE 2048
+static char cdc_queue[CDC_QUEUE_SIZE] = {0};
+static size_t cdc_queue_len = 0;
+
 // Potential divider ratio calculations for Vsense
 #define RATIO_5V   ((26.1 + 26.1) / 26.1)  // R107 and R108
-#define RATIO_12V  ((75.0 + 26.1) / 26.1) // R105 and R106
+#define RATIO_12V  ((75.0 + 26.1) / 26.1)  // R105 and R106
 #define RATIO_24V  ((191.0 + 26.1) / 26.1) // R103 and R104
+
+#define MAX_CMD_QUEUE 16
+typedef struct {
+    char* commands[MAX_CMD_QUEUE];
+    uint8_t head;
+    uint8_t tail;
+} CommandQueue;
+
+static CommandQueue cmd_queue = {0};
+
+static int enqueue_command(const char* cmd) {
+    uint8_t next_head = (cmd_queue.head + 1) % MAX_CMD_QUEUE;
+    if(next_head == cmd_queue.tail) return -1; // Queue full
+    
+    cmd_queue.commands[cmd_queue.head] = malloc(strlen(cmd)+1);
+    strcpy(cmd_queue.commands[cmd_queue.head], cmd);
+    cmd_queue.head = next_head;
+    return 0;
+}
+
+static char* dequeue_command(void) {
+    if(cmd_queue.tail == cmd_queue.head) return NULL; // Queue empty
+    char* cmd = cmd_queue.commands[cmd_queue.tail];
+    cmd_queue.tail = (cmd_queue.tail + 1) % MAX_CMD_QUEUE;
+    return cmd;
+}
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -67,6 +98,8 @@ DMA_HandleTypeDef hdma_adc1;
 
 I2C_HandleTypeDef hi2c2;
 
+SPI_HandleTypeDef hspi1;
+SPI_HandleTypeDef hspi2;
 SPI_HandleTypeDef hspi3;
 
 TIM_HandleTypeDef htim3;
@@ -74,7 +107,7 @@ TIM_HandleTypeDef htim3;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-volatile uint8_t EndOfConversion;
+volatile uint8_t EndOfADCConversion;
 uint16_t adc_data[3];
 
 float vsense_5v, vsense_12v, vsense_24v;
@@ -92,13 +125,19 @@ static void MX_ADC1_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_SPI3_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_SPI2_Init(void);
 /* USER CODE BEGIN PFP */
-void _float_to_string(float, char*);
+int cdcprintf(const char* format, ...);
+int dbgprintf(const char* format, ...);
+void cdc_process_queue(void);
 void resp_ok();
 void resp_error();
 void resp_bool(bool);
 void resp_float(float);
-void handle_command(char*);
+void resp_param_error();
+void queue_command(char*);
+void process_command(char*);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -112,6 +151,7 @@ void handle_command(char*);
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
   /* USER CODE END 1 */
 
@@ -121,7 +161,6 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -140,116 +179,93 @@ int main(void)
   MX_SPI3_Init();
   MX_USB_Device_Init();
   MX_TIM3_Init();
+  MX_SPI1_Init();
+  MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
+  // Start continuous ADC conversion
   HAL_ADC_Start_DMA(&hadc1, (uint32_t)&adc_data, 3);
   HAL_TIM_Base_Start(&htim3);
-  led_on();
 
-  // XXX: TDD operation is not implemented yet, so for now we just ignore it
-  set_sw_pos_spdt(IC1501_1502, SW_POS_2);
-  set_sw_pos_spdt(IC1601_1602, SW_POS_2);
+  // Start with a known RF setup
+  rf_reset(RF_CH_A);
+  rf_reset(RF_CH_B);
+
+  // Open for business!
+  led_on();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  if(EndOfConversion == 1)
-	  {
-		  // this should run every second with TIM3 parameters set
-		  vsense_5v = ((float)adc_data[0] / 4095.0) * 3.283 * RATIO_5V;
-		  vsense_12v = ((float)adc_data[1] / 4095.0) * 3.283 * RATIO_12V;
-		  vsense_24v = ((float)adc_data[2] / 4095.0) * 3.283 * RATIO_24V;
-		  EndOfConversion = 0;
-	  }
+    // Process cdcprintf() output queue
+    cdc_process_queue();
 
-	  //////////////
-	  // Test Cases
-	  //////////////
+    // Commands that need to talk to talk SPI etc take a long time, causing
+    // the CDC comms to break, so we have this queue to process them
+    char* next_cmd = dequeue_command();
+    if(next_cmd) {
+        process_command(next_cmd);
+        free(next_cmd);
+    }
 
-	  ////// SDR TX -> PA -> TRX IO
+    // Update ADC values, should update every second with TIM3 parameters set
+    if(EndOfADCConversion == 1) {
+      vsense_5v = ((float)adc_data[0] / 4095.0) * 3.283 * RATIO_5V;
+      vsense_12v = ((float)adc_data[1] / 4095.0) * 3.283 * RATIO_12V;
+      vsense_24v = ((float)adc_data[2] / 4095.0) * 3.283 * RATIO_24V;
+      EndOfADCConversion = 0;
+    }
+
 /*
-	  //// PM block
-	  // sw1: j2
-	  set_sw_pos_sp3t(IC904, SW_POS_2);
-	  set_sw_pos_sp3t(IC1004, SW_POS_2);
-      // sw2: don't care
-	  set_sw_pos_spdt(IC905, SW_POS_1);
-	  set_sw_pos_spdt(IC1005, SW_POS_1);
-      // sw3@ don't care
-	  set_sw_pos_spdt(IC903, SW_POS_1);
-	  set_sw_pos_spdt(IC1003, SW_POS_1);
+    // Test CH A switch GPIO
+    const uint32_t xdelay_ms = 500;
+    // 1. Toggle PM_A_SW1_V1 (PB15)
+    //HAL_GPIO_WritePin(PM_A_SW1_V1_GPIO_Port, PM_A_SW1_V1_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
+    HAL_Delay(xdelay_ms);
 
-	  //// TDD block
-	  set_sw_pos_spdt(IC1501_1502, SW_POS_2);
-	  set_sw_pos_spdt(IC1601_1602, SW_POS_2);
+    // 2. Toggle PM_A_SW1_V2 (PA8)
+    //HAL_GPIO_WritePin(PM_A_SW1_V2_GPIO_Port, PM_A_SW1_V2_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
+    HAL_Delay(xdelay_ms);
+
+    // 3. Toggle PM_A_SW2_VCTL (PC6)
+    //HAL_GPIO_WritePin(PM_A_SW2_VCTL_GPIO_Port, PM_A_SW2_VCTL_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
+    HAL_Delay(xdelay_ms);
+
+    // 4. Toggle PM_A_SW3_VCTL (PC7)
+    //HAL_GPIO_WritePin(PM_A_SW3_VCTL_GPIO_Port, PM_A_SW3_VCTL_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);
+    HAL_Delay(xdelay_ms); // Delay after the last toggle before resetting
+
+    // --- Reset All Pins ---
+    // Set all specified pins back to LOW (Reset state)
+
+    HAL_GPIO_WritePin(PM_A_SW1_V1_GPIO_Port, PM_A_SW1_V1_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(PM_A_SW1_V2_GPIO_Port, PM_A_SW1_V2_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(PM_A_SW2_VCTL_GPIO_Port, PM_A_SW2_VCTL_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(PM_A_SW3_VCTL_GPIO_Port, PM_A_SW3_VCTL_Pin, GPIO_PIN_RESET);
+    HAL_Delay(xdelay_ms); // Delay after the last toggle before resetting
 */
 
-	  ////// SDR TX -> Power Meter
-/*
-	  //// PM block
-	  // sw1: j3
-	  set_sw_pos_sp3t(IC904, SW_POS_3);
-	  set_sw_pos_sp3t(IC1004, SW_POS_3);
-      // sw2: don't care
-	  set_sw_pos_spdt(IC905, SW_POS_1);
-	  set_sw_pos_spdt(IC1005, SW_POS_1);
-      // sw3: j2
-	  set_sw_pos_spdt(IC903, SW_POS_2);
-	  set_sw_pos_spdt(IC903, SW_POS_2);
-*/
-/*
-	  setRFPowerMeter(RF_CH_A, POWER_METER_SDR);
-	  setRFPowerMeter(RF_CH_B, POWER_METER_SDR);
+    // Test 1 - RX Path, LNA Bypass, 0dB attenuation
+    //test_mode_1(); HAL_Delay(3000);
 
-	  uint16_t r = getRFPowerLevelRawBitbang(RF_CH_A);
-	  printf("SDR CH A Result: %d\r\n", r);
-	  r = getRFPowerLevelRawBitbang(RF_CH_B);
-	  printf("SDR CH B Result: %d\r\n----------------\r\n", r);
-*/
+    // Test 2 - RX Path, LNA Enable, 0dB attenuation
+    //test_mode_2(); HAL_Delay(3000);
 
-	  ////// Ext u.FL -> Power Meter
-/*
-	  //// PM block
-	  // sw1: don't care - j2: SDR_TX -> TX_OUT
-	  set_sw_pos_sp3t(IC904, SW_POS_2);
-	  set_sw_pos_sp3t(IC1004, SW_POS_2);
-      // sw2: don't care - j2: RX_IN -> SDR_RX
-	  set_sw_pos_spdt(IC905, SW_POS_1);
-	  set_sw_pos_spdt(IC1005, SW_POS_1);
-      // sw3: j1
-	  set_sw_pos_spdt(IC903, SW_POS_1);
-	  set_sw_pos_spdt(IC903, SW_POS_1);
+    // Test 3 - TX Path, PA Bypass
+    //test_mode_3(); HAL_Delay(3000);
 
-	  uint16_t r = getRFPowerLevelRawBitbang(RF_CH_A);
-	  printf("Ext CH A Result: %d\r\n", r);
-	  r = getRFPowerLevelRawBitbang(RF_CH_B);
-	  printf("Ext CH B Result: %d\r\n----------------\r\n", r);
-*/
+    // Test 4 - TX Path, PA Enable
+    //test_mode_4(); HAL_Delay(3000);
 
-	  ////// RX A IN -> RX A OUT (SDR) with attenuator
-/*
-	  //// TDD block
-	  set_sw_pos_spdt(IC1501_1502, SW_POS_2);
-	  set_sw_pos_spdt(IC1601_1602, SW_POS_2);
-	  //// PM block
-	  // sw1: don't care - j2: SDR_TX -> TX_OUT
-	  set_sw_pos_sp3t(IC904, SW_POS_2);
-	  set_sw_pos_sp3t(IC1004, SW_POS_2);
-      // sw2: j2: RX_IN -> SDR_RX
-	  set_sw_pos_spdt(IC905, SW_POS_2);
-	  set_sw_pos_spdt(IC1005, SW_POS_2);
-      // sw3: don't care
-	  set_sw_pos_spdt(IC903, SW_POS_1);
-	  set_sw_pos_spdt(IC903, SW_POS_1);
-	  //// Attenuator
-	  setRxAttenuation(RF_CH_A, 20);
-	  setRxAttenuation(RF_CH_B, 20);
-*/
+    //  Test 5 - RX Path, Variable Attenuation
+    //test_mode_5();
 
-	  //HAL_Delay(2000);
-
-	  /* USER CODE END WHILE */
+    /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
@@ -423,6 +439,86 @@ static void MX_I2C2_Init(void)
 }
 
 /**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES_RXONLY;
+  hspi1.Init.DataSize = SPI_DATASIZE_4BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 7;
+  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief SPI2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI2_Init(void)
+{
+
+  /* USER CODE BEGIN SPI2_Init 0 */
+
+  /* USER CODE END SPI2_Init 0 */
+
+  /* USER CODE BEGIN SPI2_Init 1 */
+
+  /* USER CODE END SPI2_Init 1 */
+  /* SPI2 parameter configuration*/
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_MASTER;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES_RXONLY;
+  hspi2.Init.DataSize = SPI_DATASIZE_4BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 7;
+  hspi2.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi2.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI2_Init 2 */
+
+  /* USER CODE END SPI2_Init 2 */
+
+}
+
+/**
   * @brief SPI3 Initialization Function
   * @param None
   * @retval None
@@ -445,7 +541,7 @@ static void MX_SPI3_Init(void)
   hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi3.Init.NSS = SPI_NSS_SOFT;
-  hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+  hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
   hspi3.Init.FirstBit = SPI_FIRSTBIT_LSB;
   hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -527,13 +623,13 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.Mode = UART_MODE_TX;
   huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
   huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
   huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
+  if (HAL_HalfDuplex_Init(&huart2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -579,8 +675,8 @@ static void MX_DMA_Init(void)
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-/* USER CODE BEGIN MX_GPIO_Init_1 */
-/* USER CODE END MX_GPIO_Init_1 */
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+  /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -590,81 +686,164 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, GPIO_5V_EN_Pin|GPIO_12V_EN_Pin|GPIO_PM_A_CTRL_3_Pin|GPIO_PM_A_CTRL_4_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, PWR_5V_EN_Pin|PWR_12V_EN_Pin|PM_A_SW2_VCTL_Pin|PM_A_SW3_VCTL_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PM_B_SCK_Pin|GPIO_LED_Pin|GPIO_PM_A_SCK_Pin|GPIO_PM_B_CONV_Pin
-                          |GPIO_PM_A_CTRL_2_Pin|GPIO_LNA_B_EN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LED_Pin|PM_B_CONV_Pin|PM_A_SW1_V2_Pin|LNA_B_EN_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PM_A_CONV_Pin|GPIO_PM_B_CTRL_1_Pin|GPIO_PM_B_CTRL_2_Pin|GPIO_PM_B_CTRL_3_Pin
-                          |GPIO_PM_B_CTRL_4_Pin|GPIO_PM_A_CTRL_1_Pin|GPIO_TDD_CTRL_B_Pin|GPIO_TDD_CTRL_A_Pin
-                          |GPIO_PORT1_EN_Pin|GPIO_PORT2_EN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, PM_A_CONV_Pin|PM_B_SW1_V1_Pin|PM_B_SW1_V2_Pin|PM_B_SW2_VCTL_Pin
+                          |PM_B_SW3_VCTL_Pin|PM_A_SW1_V1_Pin|TDD_MCU_B_Pin|TDD_MCU_A_Pin
+                          |PWR_PORT1_EN_Pin|PWR_PORT2_EN_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, GPIO_PA_B_EN_Pin|GPIO_LNA_A_EN_Pin|GPIO_PA_A_EN_Pin|GPIO_ATTEN_LE_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOD, PA_B_EN_Pin|LNA_A_EN_Pin|PA_A_EN_Pin|ATTEN_LE_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : GPIO_5V_EN_Pin GPIO_12V_EN_Pin GPIO_PM_A_CTRL_3_Pin GPIO_PM_A_CTRL_4_Pin */
-  GPIO_InitStruct.Pin = GPIO_5V_EN_Pin|GPIO_12V_EN_Pin|GPIO_PM_A_CTRL_3_Pin|GPIO_PM_A_CTRL_4_Pin;
+  /*Configure GPIO pins : PWR_5V_EN_Pin PWR_12V_EN_Pin PM_A_SW2_VCTL_Pin PM_A_SW3_VCTL_Pin */
+  GPIO_InitStruct.Pin = PWR_5V_EN_Pin|PWR_12V_EN_Pin|PM_A_SW2_VCTL_Pin|PM_A_SW3_VCTL_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : GPIO_12V_PG_Pin */
-  GPIO_InitStruct.Pin = GPIO_12V_PG_Pin;
+  /*Configure GPIO pin : PWR_12V_PG_Pin */
+  GPIO_InitStruct.Pin = PWR_12V_PG_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIO_12V_PG_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(PWR_12V_PG_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : GPIO_PM_B_SCK_Pin GPIO_LED_Pin GPIO_PM_A_SCK_Pin GPIO_PM_B_CONV_Pin
-                           GPIO_PM_A_CTRL_2_Pin GPIO_LNA_B_EN_Pin */
-  GPIO_InitStruct.Pin = GPIO_PM_B_SCK_Pin|GPIO_LED_Pin|GPIO_PM_A_SCK_Pin|GPIO_PM_B_CONV_Pin
-                          |GPIO_PM_A_CTRL_2_Pin|GPIO_LNA_B_EN_Pin;
+  /*Configure GPIO pins : LED_Pin PM_B_CONV_Pin PM_A_SW1_V2_Pin LNA_B_EN_Pin */
+  GPIO_InitStruct.Pin = LED_Pin|PM_B_CONV_Pin|PM_A_SW1_V2_Pin|LNA_B_EN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : GPIO_PM_B_MISO_Pin GPIO_PM_A_MISO_Pin */
-  GPIO_InitStruct.Pin = GPIO_PM_B_MISO_Pin|GPIO_PM_A_MISO_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : GPIO_PM_A_CONV_Pin GPIO_PM_B_CTRL_1_Pin GPIO_PM_B_CTRL_2_Pin GPIO_PM_B_CTRL_3_Pin
-                           GPIO_PM_B_CTRL_4_Pin GPIO_PM_A_CTRL_1_Pin GPIO_TDD_CTRL_B_Pin GPIO_TDD_CTRL_A_Pin
-                           GPIO_PORT1_EN_Pin GPIO_PORT2_EN_Pin */
-  GPIO_InitStruct.Pin = GPIO_PM_A_CONV_Pin|GPIO_PM_B_CTRL_1_Pin|GPIO_PM_B_CTRL_2_Pin|GPIO_PM_B_CTRL_3_Pin
-                          |GPIO_PM_B_CTRL_4_Pin|GPIO_PM_A_CTRL_1_Pin|GPIO_TDD_CTRL_B_Pin|GPIO_TDD_CTRL_A_Pin
-                          |GPIO_PORT1_EN_Pin|GPIO_PORT2_EN_Pin;
+  /*Configure GPIO pins : PM_A_CONV_Pin PM_B_SW1_V1_Pin PM_B_SW1_V2_Pin PM_B_SW2_VCTL_Pin
+                           PM_B_SW3_VCTL_Pin PM_A_SW1_V1_Pin TDD_MCU_B_Pin TDD_MCU_A_Pin
+                           PWR_PORT1_EN_Pin PWR_PORT2_EN_Pin */
+  GPIO_InitStruct.Pin = PM_A_CONV_Pin|PM_B_SW1_V1_Pin|PM_B_SW1_V2_Pin|PM_B_SW2_VCTL_Pin
+                          |PM_B_SW3_VCTL_Pin|PM_A_SW1_V1_Pin|TDD_MCU_B_Pin|TDD_MCU_A_Pin
+                          |PWR_PORT1_EN_Pin|PWR_PORT2_EN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : GPIO_PA_B_EN_Pin GPIO_LNA_A_EN_Pin GPIO_PA_A_EN_Pin GPIO_ATTEN_LE_Pin */
-  GPIO_InitStruct.Pin = GPIO_PA_B_EN_Pin|GPIO_LNA_A_EN_Pin|GPIO_PA_A_EN_Pin|GPIO_ATTEN_LE_Pin;
+  /*Configure GPIO pins : PA_B_EN_Pin LNA_A_EN_Pin PA_A_EN_Pin ATTEN_LE_Pin */
+  GPIO_InitStruct.Pin = PA_B_EN_Pin|LNA_A_EN_Pin|PA_A_EN_Pin|ATTEN_LE_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : GPIO_5V_PG_Pin */
-  GPIO_InitStruct.Pin = GPIO_5V_PG_Pin;
+  /*Configure GPIO pin : PWR_5V_PG_Pin */
+  GPIO_InitStruct.Pin = PWR_5V_PG_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIO_5V_PG_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(PWR_5V_PG_GPIO_Port, &GPIO_InitStruct);
 
-/* USER CODE BEGIN MX_GPIO_Init_2 */
-/* USER CODE END MX_GPIO_Init_2 */
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+
+// Add formatted text to the CDC queue
+int cdcprintf(const char* format, ...) {
+    char temp[256];
+    va_list args;
+    int chars_written;
+
+    va_start(args, format);
+    chars_written = vsnprintf(temp, sizeof(temp), format, args);
+    va_end(args);
+
+    // Check if there's enough space in the queue
+    if (cdc_queue_len + chars_written < CDC_QUEUE_SIZE - 1) {
+        strcat(cdc_queue + cdc_queue_len, temp);
+        cdc_queue_len += chars_written;
+    }
+
+    return chars_written;
+}
+
+int dbgprintf(const char* format, ...) {
+  int chars_written = 0;
+
+#ifdef DEBUG_PRINT
+  char temp[256];
+  char timestamped_temp[280]; // Larger to accommodate timestamp and prefix
+  va_list args;
+
+  uint32_t timestamp_ms = HAL_GetTick(); // Get current timestamp in milliseconds
+
+  va_start(args, format);
+  chars_written = vsnprintf(temp, sizeof(temp), format, args);
+  va_end(args);
+
+  // Create the formatted string with timestamp prefix
+  int prefix_len = snprintf(timestamped_temp, sizeof(timestamped_temp), 
+                           "#[%lu] ", timestamp_ms);
+  
+  // Copy the original message after the prefix
+  strncpy(timestamped_temp + prefix_len, temp, sizeof(timestamped_temp) - prefix_len);
+  
+  // Calculate total length including prefix
+  int total_len = prefix_len + chars_written;
+  
+  // Check if there's enough space in the queue
+  if (cdc_queue_len + total_len < CDC_QUEUE_SIZE - 1) {
+      strcat(cdc_queue + cdc_queue_len, timestamped_temp);
+      cdc_queue_len += total_len;
+  }
+#endif
+
+  return chars_written;
+}
+
+// Process the CDC queue in your main loop
+void cdc_process_queue(void) {
+    // Maximum bytes to send in one transmission
+    const size_t max_chunk_size = 64; // Adjust based on your CDC endpoint size
+
+    if (cdc_queue_len > 0) {
+        // First check if there's a newline within the first max_chunk_size characters
+        size_t bytes_to_send = max_chunk_size;
+
+        // Find the first newline in our potential chunk
+        for (size_t i = 0; i < bytes_to_send && i < cdc_queue_len; i++) {
+            if (cdc_queue[i] == '\n') {
+                // Found a newline, send up to and including this newline
+                bytes_to_send = i + 1;
+                break;
+            }
+        }
+
+        // If no newline found or beyond our chunk size, just use the max size
+        if (bytes_to_send > cdc_queue_len) {
+            bytes_to_send = cdc_queue_len;
+        }
+
+        // Only transmit if CDC is ready
+        if (CDC_Transmit_FS((uint8_t*)cdc_queue, bytes_to_send) == USBD_OK) {
+            // Shift remaining data to the beginning of the buffer
+            if (bytes_to_send < cdc_queue_len) {
+                memmove(cdc_queue, cdc_queue + bytes_to_send, cdc_queue_len - bytes_to_send);
+            }
+
+            cdc_queue_len -= bytes_to_send;
+            cdc_queue[cdc_queue_len] = '\0'; // Ensure null termination
+        }
+    }
+}
+
+// printf() calls this
 int _write(int file, char *ptr, int len) {
 #ifdef PRINTF_USB_CDC
-    while(CDC_Transmit_FS((uint8_t*)ptr, len) != USBD_OK); // this doesn't work?
-	//CDC_Transmit_FS((uint8_t*)ptr, len); // not all characters are printed with this?
+	// Just transmit, trying to be too clever here causes timeouts/problems...
+	// THIS WILL NOT WORK WITH MULTIPLE NEWLINES - use cdcprintf() instead!
+	CDC_Transmit_FS((uint8_t*)ptr, len);
 #else
     HAL_UART_Transmit(&huart2, (uint8_t*)ptr, len, 100);
 #endif
@@ -674,212 +853,428 @@ int _write(int file, char *ptr, int len) {
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-	EndOfConversion = 1;
+	EndOfADCConversion = 1;
 }
 
+////////////////////////////////////////////
 
 void resp_ok()
 {
-	printf("OK\n");
+	cdcprintf("OK\n");
 }
 
 void resp_error()
 {
-	printf("ERROR\n");
+	cdcprintf("ERROR\n");
 }
 
 void resp_int(int val)
 {
-  printf("%d\n", val);
+	cdcprintf("%d\n", val);
 }
-
 void resp_uint16(uint16_t val)
 {
-  printf("%u\n", (unsigned int)val);
+cdcprintf("%u\n", (unsigned int)val);
 }
 
 void resp_bool(bool val)
 {
 	if (val == true){
-		printf("TRUE\n");
+		cdcprintf("TRUE\n");
 	} else {
-		printf("FALSE\n");
+		cdcprintf("FALSE\n");
 	}
 }
 
 void resp_float(float val)
 {
-	char buf[8];
-    _float_to_string(val, buf);
-    printf("%s\n", buf);
+	char buf[12];
+    sprintf(buf, "%.2f", val);
+    cdcprintf("%s\n", buf);
 }
 
-void handle_command(char *cmd)
+void resp_param_error()
 {
-  // Check for commands with parameters
-  // only one for now: RXATTEN_{channel}_{value}
-  const char *rxatten_prefix = "RXATTEN_";
-  
-  if (strncmp(cmd, rxatten_prefix, strlen(rxatten_prefix)) == 0) {
-    // Find the position of the first underscore after the prefix
-    char *underscore_pos = strchr(cmd + strlen(rxatten_prefix), '_');
-    if (underscore_pos != NULL) {
-      // Extract and check the channel character
-      char channel = *(underscore_pos - 1);
-      if (channel != 'A' && channel != 'B') {
-        // Invalid channel character
-        printf("ERROR:CHN\n");
-        return;
-      }
-      // Attempt to extract a float value from the end of the command
-      float float_value;
-      if (sscanf(underscore_pos + 1, "%f", &float_value) == 1) {
-        printf("c: %c,v: %.2f\n", channel, float_value);
-      } else {
-        // Failed to extract a numeric value from the command.
-        printf("ERROR:VAL\n");
-      }
-    } else {
-      // Failed to find the channel and value separator underscore.
-      printf("ERROR:FMT\n");
-    }
-    return;
-  }
-
-  // Check for commands without parameters
-  if (strcmp(cmd, "VERSION") == 0) {
-    resp_float(FW_VER);  
-  } else if (strcmp(cmd, "LED_ON") == 0) {
-    led_on();
-    resp_ok();
-  } else if (strcmp(cmd, "LED_OFF") == 0) {
-    led_off();
-    resp_ok();
-  } else if (strcmp(cmd, "VSENSE_5V") == 0) {
-    resp_float(vsense_5v);
-  } else if (strcmp(cmd, "VSENSE_12V") == 0) {
-    resp_float(vsense_12v);
-  } else if (strcmp(cmd, "VSENSE_24V") == 0) {
-    resp_float(vsense_24v);
-  } else if (strcmp(cmd, "5V_ON") == 0) {
-    pwr_5v_on();
-    resp_ok();
-  } else if (strcmp(cmd, "12V_ON") == 0) {
-    pwr_12v_on();
-    resp_ok();
-  } else if (strcmp(cmd, "5V_OFF") == 0) {
-    pwr_5v_off();
-    resp_ok();
-  } else if (strcmp(cmd, "12V_OFF") == 0) {
-    pwr_12v_off();
-    resp_ok();
-  } else if (strcmp(cmd, "5V_PG") == 0) {
-    if (pwr_5v_pg()){
-      resp_ok();
-    } else {
-      resp_error();
-    }
-  } else if (strcmp(cmd, "12V_PG") == 0) {
-    if (pwr_12v_pg()){
-      resp_ok();
-    } else {
-      resp_error();
-    }
-  } else if (strcmp(cmd, "RELAY1_ON") == 0) {
-    relay_port1_on();
-    resp_ok();
-  } else if (strcmp(cmd, "RELAY1_OFF") == 0) {
-    relay_port1_off();
-    resp_ok();
-  } else if (strcmp(cmd, "RELAY2_ON") == 0) {
-    relay_port2_on();
-    resp_ok();
-  } else if (strcmp(cmd, "RELAY2_OFF") == 0) {
-    relay_port2_off();
-    resp_ok();
-  } else if (strcmp(cmd, "LNA_A_ACTIVE") == 0) {
-    setLNA(RF_CH_A, LNA_ACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "LNA_A_BYPASS") == 0) {
-    setLNA(RF_CH_A, LNA_BYPASS);
-    resp_ok();
-  } else if (strcmp(cmd, "LNA_B_ACTIVE") == 0) {
-    setLNA(RF_CH_B, LNA_ACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "LNA_B_BYPASS") == 0) {
-    setLNA(RF_CH_B, LNA_BYPASS);
-    resp_ok();
-  } else if (strcmp(cmd, "PA_A_ACTIVE") == 0) {
-    setPA(RF_CH_A, PA_ACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "PA_A_BYPASS") == 0) {
-    setPA(RF_CH_A, PA_BYPASS);
-    resp_ok();
-  } else if (strcmp(cmd, "PA_B_ACTIVE") == 0) {
-    setPA(RF_CH_B, PA_ACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "PA_B_BYPASS") == 0) {
-    setPA(RF_CH_B, PA_BYPASS);
-    resp_ok();
-  } else if (strcmp(cmd, "TXINHIBIT_A_ACTIVE") == 0) {
-    setTxInhibit(RF_CH_A, RF_ACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "TXINHIBIT_A_INACTIVE") == 0) {
-    setTxInhibit(RF_CH_A, RF_INACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "TXINHIBIT_B_ACTIVE") == 0) {
-    setTxInhibit(RF_CH_B, RF_ACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "TXINHIBIT_B_INACTIVE") == 0) {
-    setTxInhibit(RF_CH_B, RF_INACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "TXRXLOOP_A_ACTIVE") == 0) {
-    setTxRxLoopback(RF_CH_A, RF_ACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "TXRXLOOP_A_INACTIVE") == 0) {
-    setTxRxLoopback(RF_CH_A, RF_INACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "TXRXLOOP_B_ACTIVE") == 0) {
-    setTxRxLoopback(RF_CH_B, RF_ACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "TXRXLOOP_B_INACTIVE") == 0) {
-    setTxRxLoopback(RF_CH_B, RF_INACTIVE);
-    resp_ok();
-  } else if (strcmp(cmd, "PWRLEVEL_A_READ") == 0) {
-    uint16_t pwrlevel = getRFPowerLevelRawBitbang(RF_CH_A);
-	resp_uint16(pwrlevel);
-  } else if (strcmp(cmd, "PWRLEVEL_B_READ") == 0) {
-	uint16_t pwrlevel = getRFPowerLevelRawBitbang(RF_CH_B);
-	resp_uint16(pwrlevel);
-  } else if (strcmp(cmd, "PWRMEAS_A_OFF") == 0) {
-    setRFPowerMeter(RF_CH_A, POWER_METER_OFF);
-    resp_ok();
-  } else if (strcmp(cmd, "PWRMEAS_A_SDR") == 0) {
-    setRFPowerMeter(RF_CH_A, POWER_METER_SDR);
-    resp_ok();
-  } else if (strcmp(cmd, "PWRMEAS_A_EXT") == 0) {
-    setRFPowerMeter(RF_CH_A, POWER_METER_EXT);
-    resp_ok();
-  } else if (strcmp(cmd, "PWRMEAS_B_OFF") == 0) {
-    setRFPowerMeter(RF_CH_B, POWER_METER_OFF);
-    resp_ok();
-  } else if (strcmp(cmd, "PWRMEAS_B_SDR") == 0) {
-    setRFPowerMeter(RF_CH_B, POWER_METER_SDR);
-    resp_ok();
-  } else if (strcmp(cmd, "PWRMEAS_B_EXT") == 0) {
-    setRFPowerMeter(RF_CH_B, POWER_METER_EXT);
-    resp_ok();
-  } else if (strcmp(cmd, "RESET_A") == 0) {
-    rf_reset(RF_CH_A);
-    resp_ok();
-  } else if (strcmp(cmd, "RESET_B") == 0) {
-    rf_reset(RF_CH_B);
-    resp_ok();
-  } else {
-    //printf("Unknown command: %s\n", cmd);
-    printf("ERROR:CMD\n");
-  }
+    cdcprintf("ERROR:PARAM\n");
 }
+
+void queue_command(char *cmd)
+{
+    if (enqueue_command(cmd) != 0) {
+        dbgprintf("ERROR:CMD_QUEUE\n");
+    }
+}
+
+void process_command(char *cmd)
+{
+	dbgprintf("Received command: %s\n", cmd);
+
+    // Tokenize on : , or \n
+	char* tokens[4];
+	char* token = strtok(cmd, ":,\n");
+
+    int token_count = 0;
+    while (token_count < 4 && token != NULL) {
+        tokens[token_count++] = token;
+        token = strtok(NULL, ":,\n");
+    }
+
+    dbgprintf("<tokenizer>\n");
+    if (token_count == 0) {
+      resp_param_error();
+      dbgprintf("  no tokens!\n");
+      return;
+    } else {
+        dbgprintf("  %d token(s)\n", token_count);
+    }
+    for (int i = 0; i < token_count; i++) {
+        dbgprintf("  token %d: %s\n", i, tokens[i]);
+    }
+    dbgprintf("</tokenizer>\n");
+    /////////////////////
+
+    // Handle version command
+    if (strcmp(tokens[0], "VERSION") == 0) {
+        resp_float(FW_VER);
+        return;
+    }
+
+    // Handle LED commands
+    if (strcmp(tokens[0], "LED") == 0) {
+        if (token_count < 2) {
+            resp_param_error();
+            return;
+        }
+
+        if (strcmp(tokens[1], "ON") == 0) {
+            resp_ok();
+            led_on();
+        } else if (strcmp(tokens[1], "OFF") == 0) {
+            resp_ok();
+        	led_off();
+        } else {
+            resp_param_error();
+        }
+        return;
+    }
+
+    // Handle voltage sensing
+    if (strcmp(tokens[0], "VSENSE") == 0) {
+        if (token_count < 2) {
+            resp_param_error();
+            return;
+        }
+
+        if (strcmp(tokens[1], "5V") == 0) {
+            resp_float(vsense_5v);
+        } else if (strcmp(tokens[1], "12V") == 0) {
+            resp_float(vsense_12v);
+        } else if (strcmp(tokens[1], "24V") == 0) {
+            resp_float(vsense_24v);
+        } else {
+            resp_param_error();
+        }
+        return;
+    }
+
+    // Handle power control
+    if (strcmp(tokens[0], "PWR") == 0) {
+        if (token_count < 3) {
+            resp_param_error();
+            return;
+        }
+
+        if (strcmp(tokens[1], "ON") == 0) {
+            if (strcmp(tokens[2], "5V") == 0) {
+                resp_ok();
+                pwr_5v_on();
+            } else if (strcmp(tokens[2], "12V") == 0) {
+                resp_ok();
+                pwr_12v_on();
+            } else {
+                resp_param_error();
+            }
+        } else if (strcmp(tokens[1], "OFF") == 0) {
+            if (strcmp(tokens[2], "5V") == 0) {
+                resp_ok();
+                pwr_5v_off();
+            } else if (strcmp(tokens[2], "12V") == 0) {
+                resp_ok();
+                pwr_12v_off();
+            } else {
+                resp_param_error();
+            }
+        } else {
+            resp_param_error();
+        }
+        return;
+    }
+
+    // Handle relay control
+    if (strcmp(tokens[0], "RELAY") == 0) {
+        if (token_count < 3) {
+            resp_param_error();
+            return;
+        }
+
+        if (strcmp(tokens[1], "ON") == 0) {
+            if (strcmp(tokens[2], "1") == 0) {
+                resp_ok();
+                relay_port1_on();
+            } else if (strcmp(tokens[2], "2") == 0) {
+                resp_ok();
+                relay_port2_on();
+            } else {
+                resp_param_error();
+            }
+        } else if (strcmp(tokens[1], "OFF") == 0) {
+            if (strcmp(tokens[2], "1") == 0) {
+                resp_ok();
+                relay_port1_off();
+            } else if (strcmp(tokens[2], "2") == 0) {
+                resp_ok();
+                relay_port2_off();
+            } else {
+                resp_param_error();
+            }
+        } else {
+            resp_param_error();
+        }
+        return;
+    }
+
+    // Handle LNA control
+    if (strcmp(tokens[0], "LNA") == 0) {
+        if (token_count < 3) {
+            resp_param_error();
+            return;
+        }
+
+        if (strcmp(tokens[1], "ON") == 0) {
+            if (strcmp(tokens[2], "A") == 0) {
+                resp_ok();
+                set_lna(RF_CH_A, LNA_ACTIVE);
+            } else if (strcmp(tokens[2], "B") == 0) {
+                resp_ok();
+                set_lna(RF_CH_B, LNA_ACTIVE);
+            } else {
+                resp_param_error();
+            }
+        } else if (strcmp(tokens[1], "OFF") == 0) {
+            if (strcmp(tokens[2], "A") == 0) {
+                resp_ok();
+                set_lna(RF_CH_A, LNA_BYPASS);
+            } else if (strcmp(tokens[2], "B") == 0) {
+                resp_ok();
+                set_lna(RF_CH_B, LNA_BYPASS);
+            } else {
+                resp_param_error();
+            }
+        } else {
+            resp_param_error();
+        }
+        return;
+    }
+
+    // Handle PA control
+    if (strcmp(tokens[0], "PA") == 0) {
+        if (token_count < 3) {
+            resp_param_error();
+            return;
+        }
+
+        if (strcmp(tokens[1], "ON") == 0) {
+            if (strcmp(tokens[2], "A") == 0) {
+                resp_ok();
+                set_pa(RF_CH_A, PA_ACTIVE);
+            } else if (strcmp(tokens[2], "B") == 0) {
+                resp_ok();
+                set_pa(RF_CH_B, PA_ACTIVE);
+            } else {
+                resp_param_error();
+            }
+        } else if (strcmp(tokens[1], "OFF") == 0) {
+            if (strcmp(tokens[2], "A") == 0) {
+                resp_ok();
+                set_pa(RF_CH_A, PA_BYPASS);
+            } else if (strcmp(tokens[2], "B") == 0) {
+                resp_ok();
+                set_pa(RF_CH_B, PA_BYPASS);
+            } else {
+                resp_param_error();
+            }
+        } else {
+            resp_param_error();
+        }
+        return;
+    }
+
+    // Handle TDD control
+    if (strcmp(tokens[0], "TDD") == 0) {
+        if (token_count < 3) {
+            resp_param_error();
+            return;
+        }
+
+        if (strcmp(tokens[1], "ON") == 0) {
+            if (strcmp(tokens[2], "A") == 0) {
+                resp_ok();
+                set_tdd_mode(RF_CH_A, RF_ACTIVE);
+            } else if (strcmp(tokens[2], "B") == 0) {
+                resp_ok();
+                set_tdd_mode(RF_CH_B, RF_ACTIVE);
+            } else {
+                resp_param_error();
+            }
+        } else if (strcmp(tokens[1], "OFF") == 0) {
+            if (strcmp(tokens[2], "A") == 0) {
+                resp_ok();
+                set_tdd_mode(RF_CH_A, RF_INACTIVE);
+            } else if (strcmp(tokens[2], "B") == 0) {
+                resp_ok();
+                set_tdd_mode(RF_CH_B, RF_INACTIVE);
+            } else {
+                resp_param_error();
+            }
+        } else {
+            resp_param_error();
+        }
+        return;
+    }
+
+    // Handle RXATTEN commands
+    if (strcmp(tokens[0], "RXATTEN") == 0) {
+        dbgprintf(">> parsing RXATTEN\n");
+        if (token_count < 3) {
+            resp_param_error();
+            return;
+        }
+
+        rf_channel_t channel;
+        if (strcmp(tokens[1], "A") == 0) {
+            channel = RF_CH_A;
+        } else if (strcmp(tokens[1], "B") == 0) {
+            channel = RF_CH_B;
+        } else {
+            resp_param_error();
+            return;
+        }
+
+        char *endptr;
+        float atten_value = strtof(tokens[2], &endptr);
+        if (endptr == tokens[2] || *endptr != '\0') {
+            resp_param_error();
+            return;
+        }
+
+        resp_ok();
+
+        set_rx_atten(channel, atten_value);
+
+        dbgprintf(">> set RXATTEN %s %f\n", tokens[1], atten_value);
+        return;
+    }
+
+    // Handle Reset
+    if (strcmp(tokens[0], "RESET") == 0) {
+    	if (token_count < 2) {
+          resp_param_error();
+          return;
+      }
+
+      rf_channel_t channel;
+      if (strcmp(tokens[1], "A") == 0) {
+          channel = RF_CH_A;
+      } else if (strcmp(tokens[1], "B") == 0) {
+          channel = RF_CH_B;
+      } else {
+          resp_param_error();
+          return;
+      }
+
+      resp_ok();
+      
+      rf_reset(channel);
+
+      return;
+    }
+
+    // Handle SW:<name>:<pos> command
+    if (strcmp(tokens[0], "SW") == 0) {
+        if (token_count < 3) {
+            resp_param_error();
+            return;
+        }
+        // Map switch name to switch object and type
+        rf_switch_pos_t pos = SW_POS_NONE;
+        if (strcmp(tokens[2], "J1") == 0) pos = SW_POS_1;
+        else if (strcmp(tokens[2], "J2") == 0) pos = SW_POS_2;
+        else if (strcmp(tokens[2], "J3") == 0) pos = SW_POS_3;
+        else {
+            resp_param_error();
+            return;
+        }
+
+        // Switches: SW1A, SW1B, SW2A, SW2B, SW3A, SW3B, TDD_A, TDD_B
+        if (strcmp(tokens[1], "SW1A") == 0) {
+            set_sw_pos_sp3t(IC904, pos);
+            resp_ok();
+        } else if (strcmp(tokens[1], "SW1B") == 0) {
+            set_sw_pos_sp3t(IC1004, pos);
+            resp_ok();
+        } else if (strcmp(tokens[1], "SW2A") == 0) {
+            if (pos == SW_POS_3 || pos == SW_POS_NONE) {
+                resp_param_error();
+            } else {
+                set_sw_pos_spdt(IC905, pos);
+                resp_ok();
+            }
+        } else if (strcmp(tokens[1], "SW2B") == 0) {
+            if (pos == SW_POS_3 || pos == SW_POS_NONE) {
+                resp_param_error();
+            } else {
+                set_sw_pos_spdt(IC1005, pos);
+                resp_ok();
+            }
+        } else if (strcmp(tokens[1], "SW3A") == 0) {
+            if (pos == SW_POS_3 || pos == SW_POS_NONE) {
+                resp_param_error();
+            } else {
+                set_sw_pos_spdt(IC903, pos);
+                resp_ok();
+            }
+        } else if (strcmp(tokens[1], "SW3B") == 0) {
+            if (pos == SW_POS_3 || pos == SW_POS_NONE) {
+                resp_param_error();
+            } else {
+                set_sw_pos_spdt(IC1003, pos);
+                resp_ok();
+            }
+        } else if (strcmp(tokens[1], "TDDA") == 0) {
+            if (pos == SW_POS_3 || pos == SW_POS_NONE) {
+                resp_param_error();
+            } else {
+                set_sw_pos_spdt(IC1501_1502, pos);
+                resp_ok();
+            }
+        } else if (strcmp(tokens[1], "TDDB") == 0) {
+            if (pos == SW_POS_3 || pos == SW_POS_NONE) {
+                resp_param_error();
+            } else {
+                set_sw_pos_spdt(IC1601_1602, pos);
+                resp_ok();
+            }
+        } else {
+            resp_param_error();
+        }
+        return;
+    }
+
+    // we shouldn't get here...
+    cdcprintf("ERROR:CMD\n");
+}
+
+////////////////////////////////////////////
 /* USER CODE END 4 */
 
 /**
